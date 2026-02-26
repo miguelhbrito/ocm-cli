@@ -111,6 +111,9 @@ var args struct {
 	serviceCIDR net.IPNet
 	podCIDR     net.IPNet
 
+	// DNS options
+	dns c.DNS
+
 	// Default Ingress Attributes
 	defaultIngressRouteSelectors           string
 	defaultIngressExcludedNamespaces       string
@@ -426,6 +429,14 @@ func init() {
 	Cmd.RegisterFlagCompletionFunc("wif-config", arguments.MakeCompleteFunc(getWifConfigNameOptions))
 
 	addGcpEncryptionFlags(fs, &args.gcpEncryption)
+
+	fs.StringVar(
+		&args.dns.BaseDomain,
+		"base-domain",
+		"",
+		"The DNS base domain for the cluster.",
+	)
+	arguments.SetQuestion(fs, "base-domain", "DNS Base Domain:")
 
 }
 
@@ -903,6 +914,11 @@ func preRun(cmd *cobra.Command, argv []string) error {
 		return err
 	}
 
+	err = promptDNS(fs, connection)
+	if err != nil {
+		return err
+	}
+
 	err = promptPrivateServiceConnect(fs)
 	if err != nil {
 		return err
@@ -959,6 +975,7 @@ func run(cmd *cobra.Command, argv []string) error {
 		Provider:             args.provider,
 		CCS:                  args.ccs,
 		ExistingVPC:          args.existingVPC,
+		DNS:                  args.dns,
 		ClusterWideProxy:     args.clusterWideProxy,
 		Flavour:              args.flavour,
 		MultiAZ:              args.multiAZ,
@@ -1537,6 +1554,70 @@ func promptExistingVPC(fs *pflag.FlagSet, connection *sdk.Connection) error {
 		err = promptExistingGCPVPC(fs, connection)
 	}
 	return err
+}
+
+func promptDNS(fs *pflag.FlagSet, connection *sdk.Connection) error {
+	var err error
+	if args.dns.BaseDomain != "" {
+		args.dns.Enabled = true
+	}
+	if !args.dns.Enabled && args.interactive {
+		args.dns.Enabled, err = interactive.GetBool(interactive.Input{
+			Question: "Use a BYO DNS managed zone",
+			Help:     "To use a BYO DNS managed zone, you need to provide the base domain.",
+			Default:  args.dns.Enabled,
+		})
+		if err != nil {
+			return err
+		}
+	}
+	if args.dns.Enabled {
+		dnsDomains, err := getDnsDomainOptions(connection)
+		if err != nil {
+			return err
+		}
+
+		flag := fs.Lookup("base-domain")
+		// If the flag was set, validate the value
+		if flag.Changed {
+			if err := arguments.CheckOneOf(fs, "base-domain", dnsDomains); err != nil {
+				return err
+			}
+			return nil
+		}
+
+		// If the flag was not set, prompt the user
+		err = arguments.PromptOneOf(fs, "base-domain", dnsDomains)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func getDnsDomainOptions(connection *sdk.Connection) ([]arguments.Option, error) {
+	var dnsDomains []arguments.Option
+	response, err := connection.ClustersMgmt().V1().
+		DNSDomains().
+		List().
+		Size(-1).
+		Send()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list DNS domains: %v", err)
+	}
+	for _, domain := range response.Items().Slice() {
+		// Only include domains not assigned to a cluster
+		if domain.Cluster() == nil || domain.Cluster().ID() == "" {
+			dnsDomains = append(dnsDomains, arguments.Option{
+				Value: domain.ID(),
+			})
+		}
+	}
+
+	if len(dnsDomains) == 0 {
+		return nil, fmt.Errorf("no available DNS domains found")
+	}
+	return dnsDomains, nil
 }
 
 func promptClusterPrivacy(fs *pflag.FlagSet) error {
